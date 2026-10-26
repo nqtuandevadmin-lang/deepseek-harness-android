@@ -1,0 +1,135 @@
+
+name: Build DeepSeek Harness APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22.22.2'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: '11.19.0'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android packages
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.1.12297006" \
+            "cmake;3.22.1"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync Android project
+        run: pnpm run android:sync
+
+      - name: Prepare verified runtime assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base="https://github.com/dphmoblie/deepseek-harness-android/releases/download/v0.3.4-mobile-557"
+          mkdir -p /tmp/dsh-release
+
+          curl -fLsS --retry 3 \
+            "$base/app-release.apk" \
+            -o /tmp/dsh-release/app-release.apk
+
+          curl -fLsS --retry 3 \
+            "$base/checksums.txt" \
+            -o /tmp/dsh-release/checksums.txt
+
+          cd /tmp/dsh-release
+
+          sha256sum --check --ignore-missing checksums.txt
+
+          unzip -p app-release.apk \
+            assets/runtime/rootfs.bundle > rootfs.bundle
+
+          unzip -p app-release.apk \
+            assets/runtime/runtime-manifest.json > runtime-manifest.json
+
+          sha256sum --check --ignore-missing checksums.txt
+
+          cd "$GITHUB_WORKSPACE"
+
+          mkdir -p android/app/src/main/assets/runtime
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+
+          cp /tmp/dsh-release/rootfs.bundle \
+            android/app/src/main/assets/runtime/rootfs.bundle
+
+          cp /tmp/dsh-release/runtime-manifest.json \
+            android/app/src/main/assets/runtime/runtime-manifest.json
+
+          unzip -p /tmp/dsh-release/app-release.apk \
+            lib/arm64-v8a/libdsh_proot.so \
+            > android/app/src/main/jniLibs/arm64-v8a/libdsh_proot.so
+
+          unzip -p /tmp/dsh-release/app-release.apk \
+            lib/arm64-v8a/libdsh_proot_loader.so \
+            > android/app/src/main/jniLibs/arm64-v8a/libdsh_proot_loader.so
+
+          printf '%s  %s\n' \
+            'cb40a1ced11cee76569b4008a9e478c87883ce831152be4eb9570763b82e580d' \
+            'android/app/src/main/jniLibs/arm64-v8a/libdsh_proot.so' \
+            | sha256sum --check -
+
+          printf '%s  %s\n' \
+            'f149774236db1e69b36cc1e4ed3866c7094db2eee52da0d4956aa63a9bb26929' \
+            'android/app/src/main/jniLibs/arm64-v8a/libdsh_proot_loader.so' \
+            | sha256sum --check -
+
+      - name: Generate Gradle Wrapper
+        run: pnpm run bootstrap:wrapper
+
+      - name: Build Debug APK
+        working-directory: android
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Verify bundled runtime
+        run: |
+          python3 scripts/verify-bundle.py \
+            --apk android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: deepseek-harness-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 3
